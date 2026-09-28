@@ -25,6 +25,7 @@ docker compose up --build
 - 健康检查： http://localhost:8000/health
 - 编排接口： `POST http://localhost:8000/api/v1/arrangements`
 - 纠位接口： `POST http://localhost:8000/api/v1/arrangements/reconcile`
+- 空间质控接口： `POST http://localhost:8000/api/v1/arrangements/spatial-qc`
 
 不使用 Docker 时（Python 3.11+):
 
@@ -231,13 +232,152 @@ curl -X POST http://localhost:8000/api/v1/arrangements/reconcile \
 
 无闭环时 `staging_well` 可省略（即使提供也不使用）。
 
+## 空间质控接口 `POST /api/v1/arrangements/spatial-qc`
+
+对已完成编排的板做空间效应质控：先按**实验组中位数中心化**读数（避免组间
+基线差异混入空间效应），再用**行列中位数交替剥离（median polish)**
+累计总体、逐行、逐列效应，并以 seed 控制的**组内置换**给出最大行列效应的
+**加一修正经验 p 值**。读数允许缺失（孔位省略或显式 `null`)。
+
+端口 `8000` 调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/arrangements/spatial-qc \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plate": {"type": "24"},
+    "layout": {
+      "S1": "A1", "S2": "A2", "S3": "B1", "S4": "B2",
+      "S5": "C1", "S6": "C2", "S7": "D1", "S8": "D2"
+    },
+    "samples": [
+      {"id": "S1", "group": "treated"}, {"id": "S2", "group": "control"},
+      {"id": "S3", "group": "treated"}, {"id": "S4", "group": "control"},
+      {"id": "S5", "group": "treated"}, {"id": "S6", "group": "control"},
+      {"id": "S7", "group": "treated"}, {"id": "S8", "group": "control"}
+    ],
+    "readings": {
+      "A1": 1.05, "A2": 0.98, "B1": 1.02, "B2": 1.01,
+      "C1": 1.04, "C2": 0.99, "D1": 1.03,
+      "D2": null
+    },
+    "seed": 42,
+    "permutations": 1000,
+    "tolerance": 0.000001,
+    "max_iterations": 1000
+  }'
+```
+
+### 请求字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `plate` | object | 板型，与编排接口相同（默认 `"96"`) |
+| `layout` | object | 布局映射：样本 id → 孔位（编排接口响应中的 `layout`) |
+| `samples[]` | array | 样本列表，每项 `{id, group}`;`id` 必须与 `layout` 一一对应 |
+| `readings` | object | 孔位 → 数值读数；**孔位省略或显式 `null` 表示读数缺失**;`NaN`/`Infinity` 不允许 |
+| `seed` | int | 随机种子（≥0)，控制组内置换；相同输入与 seed 结果完全一致 |
+| `permutations` | int | 组内置换次数，默认 `1000`，范围 0–1,000,000;`0` 表示跳过置换（`p_value` 为 `null`) |
+| `tolerance` | float | 收敛阈值（>0)，默认 `1e-6`；本轮最大行列校正量 ≤ tolerance 即收敛 |
+| `max_iterations` | int | 行列交替剥离的最大轮数，默认 `1000`(≥1)；未达 tolerance 即返回 422 |
+
+### 算法
+
+1. **组中位数中心化**：每个有效读数减去其所在 `group` 的读数中位数。
+2. **行列中位数交替剥离**：每轮先逐行减去行内（非缺失）中位数并累加到行
+   效应，再逐列减去列内中位数并累加到列效应；记录本轮行、列及最大校正量。
+   当本轮**最大校正量 ≤ `tolerance`** 时收敛，否则继续，最多 `max_iterations`
+   轮。收敛后将行、列效应中位数依次归零（偏移量最终并入总体效应），使效应
+   分解与剥离顺序无关。
+3. **校正读数**：`校正读数 = 组中位数 + 残差 = 原读数 −（总体 + 行 + 列）`,
+   即剥离拟合空间面但保留组基线；缺失孔不出现在输出中。
+4. **置换检验**：在**每个 group 内部**，以 seed 驱动的确定性随机数把有效
+   读数在该组有效孔位间重新分配（缺失孔位置与每组有效孔数保持不变），
+   对每次置换重复同一校正流程；统计量为**全部行、列效应绝对值的最大值**。
+   经验 p 值采用加一修正：`p = (1 + #{T_perm ≥ T_obs}) / (1 + permutations)`,
+   因此取值范围恒为 `(0, 1]`，永远不会为 0。
+
+### 响应（200)
+
+```json
+{
+  "seed": 42,
+  "plate": {"type": "24", "rows": 4, "columns": 6},
+  "parameters": {"permutations": 1000, "tolerance": 1e-6, "max_iterations": 1000},
+  "groups": [
+    {"group": "control", "valid_readings": 3, "valid_rows": 3,
+     "valid_columns": 2, "median": 0.99},
+    {"group": "treated", "valid_readings": 4, "valid_rows": 4,
+     "valid_columns": 2, "median": 1.035}
+  ],
+  "effects": {
+    "overall": 0.0,
+    "row_effects": [0.0, 0.0, 0.0, 0.0],
+    "col_effects": [0.02, -0.02, 0.0, 0.0, 0.0, 0.0],
+    "max_abs_row_col_effect": 0.02
+  },
+  "readings": [
+    {"well": "A1", "sample_id": "S1", "group": "treated",
+     "reading": 1.05, "centred_reading": 0.015,
+     "corrected_reading": 1.015}
+  ],
+  "convergence": {
+    "converged": true,
+    "iterations": 2,
+    "tolerance": 1e-6,
+    "trajectory": [
+      {"iteration": 1, "row_correction": 0.02, "col_correction": 0.02,
+       "max_correction": 0.02}
+    ]
+  },
+  "permutation_test": {
+    "permutations": 1000,
+    "observed_statistic": 0.02,
+    "exceedances": 24,
+    "p_value": 0.024975,
+    "method": "within-group well permutation; p=(1+#{T_perm>=T_obs})/(1+n)"
+  }
+}
+```
+
+- `groups`：各组有效读数数、覆盖的行数/列数与组中位数（中心化基准）。
+- `effects`：总体效应、逐行/逐列效应（长度等于板行数/列数）及统计量
+  `max_abs_row_col_effect`。
+- `readings`：逐孔给出原始读数、组内中心化读数与校正读数（按行优先顺序，
+  仅含有效孔）。
+- `convergence.trajectory`：逐轮行校正量、列校正量与最大校正量。
+- `permutation_test`：观测统计量、达到或超过它的置换次数与加一修正 p 值；
+  `permutations = 0` 时 `p_value` 为 `null`。
+
+### 不可分析（422，不输出部分结论）
+
+满足以下任一条件即返回 422，**不返回任何效应、校正读数或 p 值**，响应在
+`infeasibility_categories` 与 `messages` 中列出全部问题：
+
+| 类别 | 含义 |
+| --- | --- |
+| `SPATIAL_GROUP_INSUFFICIENT` | 任一组有效读数少于 2 |
+| `SPATIAL_GRID_INSUFFICIENT` | 有效孔未覆盖至少 2 个不同行或 2 个不同列 |
+| `SPATIAL_NOT_CONVERGED` | 观测数据（或任一次置换重复）在 `max_iterations` 内未收敛 |
+| `SPATIAL_SAMPLE_DUPLICATED` | `samples` 中样本 id 重复 |
+| `SPATIAL_SAMPLE_UNKNOWN` | `layout` 引用了 `samples` 中不存在的样本 |
+| `SPATIAL_LAYOUT_CONFLICT` | 多样本占用同一孔，或样本未在 `layout` 中安排孔位 |
+| `SPATIAL_READING_INVALID` | 读数对应孔位在 `layout` 中无人占用 |
+| `SPATIAL_READING_DUPLICATED` | 同一孔位（大小写不敏感）出现多个读数 |
+| `WELL_REFERENCE_INVALID` | 孔位名称非法或越界 |
+| `PLATE_DIMENSION_INVALID` | 板型尺寸非法 |
+| `REQUEST_VALIDATION_ERROR` | 请求体结构不合法（含 `NaN`/`Infinity` 读数等） |
+
 ## 确定性保证
 
 - 求解器固定为**单 worker**、固定 `random_seed`，并以**确定性时间预算**
   (`max_deterministic_time`）而非墙钟时间作为主要停止条件；
 - 第三阶段把第二阶段的最优解作为完整 hint 回注并取首个解，
   因此相同（输入， seed）在相同依赖版本下必然产生逐孔一致的布局；
-- 响应中的 `layout` 可直接作为回归测试基准。
+- 响应中的 `layout` 可直接作为回归测试基准；
+- 空间质控接口的组内置换使用 seed 初始化的独立确定性随机流，相同
+  （输入， seed)（含 `permutations`/`tolerance`/`max_iterations`)
+  必然得到逐位一致的效应、校正读数、收敛轨迹与 p 值。
 
 ## 配置（环境变量）
 
@@ -267,9 +407,10 @@ app/
   schemas.py   请求/响应模型与不可行类别常量
   planner.py   三阶段字典序 CP-SAT 求解（平衡 → 邻接 → 确定性决胜）
   reconciler.py 扫描核对与最少步数纠位指令生成（空孔链 → 闭环暂存）
+  spatial_qc.py 组中位数中心化 + 行列中位数剥离（median polish）与组内置换检验
   metrics.py   指标独立重算与布局约束校验
   plates.py    板型预设与孔位命名解析
-tests/         pytest 测试（解析、求解、API、纠位）
+tests/         pytest 测试（解析、求解、API、纠位、空间质控）
 Dockerfile     单容器构建
 docker-compose.yml  单命令启动
 ```
