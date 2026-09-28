@@ -11,7 +11,8 @@ from .metrics import compute_spreads, count_adjacent_pairs, verify_layout
 from .planner import InfeasibleArrangement, SolverTimeout, plan_layout
 from .plates import parse_well
 from .reconciler import ReconcileInvalid, StagingConflict, reconcile
-from .schemas import ArrangeRequest, ReconcileRequest
+from .schemas import ArrangeRequest, ReconcileRequest, SpatialQCRequest
+from .spatial_qc import SpatialQCInvalid, spatial_qc
 
 app = FastAPI(
     title="微孔板样本编排 API",
@@ -75,6 +76,21 @@ async def reconcile_invalid_handler(request: Request, exc: ReconcileInvalid) -> 
         content={
             "detail": "The reconciliation request is inconsistent; "
             "no move instructions were generated.",
+            "infeasibility_categories": exc.categories,
+            "messages": exc.messages,
+        },
+    )
+
+
+@app.exception_handler(SpatialQCInvalid)
+async def spatial_qc_invalid_handler(request: Request, exc: SpatialQCInvalid) -> JSONResponse:
+    # 422 for insufficient/malformed readings or non-convergence;
+    # no effects, corrected readings or p-value are ever emitted.
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "The spatial-QC request cannot be evaluated; "
+            "no partial conclusion is returned.",
             "infeasibility_categories": exc.categories,
             "messages": exc.messages,
         },
@@ -214,3 +230,15 @@ def _well_sort_key(name: str, rows: int, cols: int):
 )
 async def reconcile_arrangement(req: ReconcileRequest) -> dict:
     return reconcile(req)
+
+
+@app.post(
+    "/api/v1/arrangements/spatial-qc",
+    summary="空间效应质量控制:组内中位数中心化 + 行/列中位数剥离与置换检验",
+    responses={
+        200: {"description": "返回总体及逐行/逐列效应、校正读数、收敛轨迹与加一修正经验 p 值"},
+        422: {"description": "读数/分组/覆盖不足或算法未收敛,列出问题,不输出部分结论"},
+    },
+)
+async def spatial_qc_arrangement(req: SpatialQCRequest) -> dict:
+    return spatial_qc(req)

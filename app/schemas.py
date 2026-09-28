@@ -26,6 +26,14 @@ VIOLATION_SAMPLES_MISSING = "SAMPLES_MISSING"
 VIOLATION_UNPLANNED_SAMPLES = "UNPLANNED_SAMPLES"
 VIOLATION_BLOCKED_WELL_OCCUPIED = "BLOCKED_WELL_OCCUPIED"
 
+# Categories reported in 422 responses of the spatial-QC endpoint.
+VIOLATION_LAYOUT_WELLS_DUPLICATED = "LAYOUT_WELLS_DUPLICATED"
+VIOLATION_GROUP_MEMBERSHIP_INVALID = "GROUP_MEMBERSHIP_INVALID"
+VIOLATION_READING_MALFORMED = "READING_MALFORMED"
+VIOLATION_READING_GROUP_INSUFFICIENT = "READING_GROUP_INSUFFICIENT"
+VIOLATION_READING_COVERAGE_INSUFFICIENT = "READING_COVERAGE_INSUFFICIENT"
+VIOLATION_SPATIAL_QC_DID_NOT_CONVERGE = "SPATIAL_QC_DID_NOT_CONVERGE"
+
 
 class PlateSpec(BaseModel):
     """Plate geometry.
@@ -99,3 +107,33 @@ class ReconcileRequest(BaseModel):
     staging_well: Optional[str] = Field(
         default=None, description="空闲且非目标的暂存孔,用于解开闭环错位"
     )
+
+
+class SpatialQCRequest(BaseModel):
+    """Spatial-effect quality control on a plate of numeric readings.
+
+    Readings are first centered within every sample ``group`` (subtracting
+    the group median) so that inter-group biological differences are not
+    mistaken for spatial effects; an additive row/column effect is then
+    extracted by a median-polish sweep loop. A seeded within-group well
+    permutation provides an empirical, plus-one-corrected p-value for the
+    maximum absolute row/column effect.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    plate: PlateSpec = Field(default_factory=PlateSpec)
+    layout: dict[str, str] = Field(
+        min_length=1, description="现有布局:样本 id → 孔位(同编排接口的 layout)"
+    )
+    groups: dict[str, str] = Field(
+        min_length=1, description="样本 group:样本 id → 实验组标识"
+    )
+    readings: dict[str, Optional[float]] = Field(
+        min_length=1,
+        description="数值读数:孔位 → 读数;孔位缺失或取值为 null 均视为读数缺失",
+    )
+    seed: int = Field(default=0, ge=0)
+    n_permutations: int = Field(default=99, ge=0)
+    max_iterations: int = Field(default=1000, ge=1)
+    tolerance: float = Field(default=1e-8, ge=0.0)

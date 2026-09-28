@@ -25,6 +25,7 @@ docker compose up --build
 - 健康检查： http://localhost:8000/health
 - 编排接口： `POST http://localhost:8000/api/v1/arrangements`
 - 纠位接口： `POST http://localhost:8000/api/v1/arrangements/reconcile`
+- 空间质控接口： `POST http://localhost:8000/api/v1/arrangements/spatial-qc`
 
 不使用 Docker 时（Python 3.11+):
 
@@ -231,6 +232,147 @@ curl -X POST http://localhost:8000/api/v1/arrangements/reconcile \
 
 无闭环时 `staging_well` 可省略（即使提供也不使用）。
 
+## 空间质控接口 `POST /api/v1/arrangements/spatial-qc`
+
+对一板**数值读数**做空间效应质控。先按样本 `group` 中位数中心化（避免组间生物学
+差异混入空间效应），再用**中位数平滑（median polish）**迭代剥离并累加行、列
+中位数，最后在各 group 内置换读数孔位做经验显著性检验。**允许读数缺失**（孔位
+不列出或显式给 `null`，均不参与任何中位数）。
+
+算法每轮：
+
+1. 对每行取当前残差中位数，从该行每个读数中减去，并累加进该行效应；
+2. 对每列做同样的剥离与累加；
+3. 行、列效应分别再中心化（把扫出的公共位置折进总体效应 `overall_effect`）；
+4. 记录本轮**最大校正量**（被应用的最大 |行中位数|、|列中位数| 及两次再中心化量），
+   不超过 `tolerance` 即收敛，否则继续，最多 `max_iterations` 轮。
+
+置换检验：用 `seed` 初始化随机数，**在每个 group 内部**把有效读数随机重排到该
+group 的孔位上，每次重复执行完全相同的中心化 + 平滑；统计量
+`T = max(|行效应|, |列效应|)`，p 值采用**加一修正**：
+
+```
+p = (1 + #{T* >= T}) / (1 + n_permutations)
+```
+
+### 请求示例（8000 端口）
+
+```bash
+curl -X POST http://localhost:8000/api/v1/arrangements/spatial-qc \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plate": {"type": "custom", "rows": 3, "columns": 4},
+    "layout": {"S01": "A1", "S02": "A2", "S03": "B1", "S04": "B2",
+               "S05": "C3", "S06": "C4"},
+    "groups": {"S01": "treated", "S02": "control", "S03": "control",
+               "S04": "treated", "S05": "treated", "S06": "control"},
+    "readings": {"A1": 0.82, "A2": 1.21, "B1": 1.05, "B2": null,
+                 "C3": 1.33, "C4": 1.60},
+    "seed": 42,
+    "n_permutations": 99,
+    "max_iterations": 1000,
+    "tolerance": 1e-8
+  }'
+```
+
+### 请求字段
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `plate` | object | 板型，与编排接口相同（默认 `"96"`) |
+| `layout` | object | 现有布局：样本 id → 孔位（即编排接口响应中的 `layout`) |
+| `groups` | object | 样本 group:样本 id → 实验组标识；`layout` 中每个样本都必须出现 |
+| `readings` | object | 数值读数：孔位 → 浮点数；孔位省略或取值 `null` 表示读数缺失 |
+| `seed` | int | 随机种子（≥0，默认 0)，控制组内置换，相同（输入， seed）结果逐位一致 |
+| `n_permutations` | int | 置换次数（≥0，默认 99);`0` 时只做观测板分析，p 值恒为 1 |
+| `max_iterations` | int | 平滑迭代上限（≥1，默认 1000) |
+| `tolerance` | float | 收敛阈值（≥0，默认 `1e-8`):本轮最大校正量不超过它即停止 |
+
+### 响应（200)
+
+以下为上面 3×4 示例请求（`n_permutations=99`) 的真实返回（轨迹有节选）:
+
+```json
+{
+  "seed": 42,
+  "plate": {"type": "custom", "rows": 3, "columns": 4},
+  "valid_wells": ["A1", "A2", "B1", "C3", "C4"],
+  "groups": [
+    {"group": "control", "valid_readings": 3, "median": 1.21,
+     "covered_rows": ["A", "B", "C"], "covered_columns": [1, 2, 4]},
+    {"group": "treated", "valid_readings": 2, "median": 1.075,
+     "covered_rows": ["A", "C"], "covered_columns": [1, 3]}
+  ],
+  "effects": {
+    "overall_effect": -0.075,
+    "row_effects": [-0.095, 0.0, 0.3975],
+    "col_effects": [-0.085, 0.17, -0.0675, 0.0675],
+    "max_row_effect": 0.3975,
+    "max_col_effect": 0.17,
+    "max_axis_effect": 0.3975,
+    "row_labels": ["A", "B", "C"],
+    "column_labels": [1, 2, 3, 4]
+  },
+  "corrected_readings": {
+    "A1": 1.075, "A2": 1.21, "B1": 1.21, "B2": null,
+    "C3": 1.075, "C4": 1.21
+  },
+  "convergence": {
+    "converged": true,
+    "iterations": 14,
+    "max_iterations": 1000,
+    "tolerance": 1e-08,
+    "final_max_correction": 3.8e-09,
+    "trajectory": [
+      {"iteration": 1, "max_correction": 0.3225, "row_recentre": -0.1275,
+       "col_recentre": 0.001875, "overall_effect": -0.125625,
+       "max_row_effect": 0.45, "max_col_effect": 0.125625},
+      {"iteration": 2, "max_correction": 0.06375, "..." : "..."},
+      {"iteration": 14, "max_correction": 3.8e-09, "row_recentre": 3.8e-09,
+       "col_recentre": 0.0, "overall_effect": -0.075,
+       "max_row_effect": 0.3975, "max_col_effect": 0.17}
+    ]
+  },
+  "permutation_test": {
+    "n_permutations": 99,
+    "statistic": "max(abs(row_effects) U abs(col_effects))",
+    "observed_statistic": 0.3975,
+    "permutation_statistics": [0.415, 0.2767, 0.3917, 0.3508, "..."],
+    "exceedances": 32,
+    "p_value": 0.33,
+    "p_value_method": "plus-one empirical: (1 + #{T* >= T}) / (1 + n_permutations)"
+  }
+}
+```
+
+- `effects`:总体效应与逐行、逐列效应（空行/空列为 0)，以及最大行/列效应。
+- `corrected_readings`:**校正读数**（读数 − 总体 − 行 − 列，保留组水平），
+  缺失孔位为 `null`；恒有
+  `校正读数 + 总体效应 + 行效应 + 列效应 = 原始读数`。
+- `convergence.trajectory`:逐轮**收敛轨迹**（轮次、最大校正量、再中心化量、
+  累计总体效应与当时最大行/列效应）。
+- `permutation_test`:观测统计量、每次置换的统计量、达到/超过观测值的次数
+  `exceedances` 与加一修正经验 p 值。
+
+### 不可评估（422，不输出部分结论）
+
+以下任一情况返回 422，响应只包含 `infeasibility_categories` 与 `messages`，
+**绝不输出效应、校正读数或 p 值**:
+
+| 类别 | 含义 |
+| --- | --- |
+| `READING_GROUP_INSUFFICIENT` | 任一 group 有效读数少于 2（或根本没有有效读数） |
+| `READING_COVERAGE_INSUFFICIENT` | 有效孔位未同时覆盖至少 2 行和 2 列 |
+| `SPATIAL_QC_DID_NOT_CONVERGE` | 观测板或任一置换重复在 `max_iterations` 内未收敛 |
+| `LAYOUT_WELLS_DUPLICATED` | 多个样本被排到同一孔位 |
+| `GROUP_MEMBERSHIP_INVALID` | 样本缺少 group、group 为空，或引用了 layout 之外的样本 |
+| `WELL_REFERENCE_INVALID` | 孔位名称非法或越出板型 |
+| `READING_MALFORMED` | 读数非有限数值，或读数孔位不属于 layout |
+| `REQUEST_VALIDATION_ERROR` | 请求体结构不合法（字段缺失/类型错误等） |
+
+> 注意：置换重复中只要有一次未收敛，同样返回 422（类别
+> `SPATIAL_QC_DID_NOT_CONVERGE`)，不会返回基于部分重复的 p 值。
+
 ## 确定性保证
 
 - 求解器固定为**单 worker**、固定 `random_seed`，并以**确定性时间预算**
@@ -267,9 +409,10 @@ app/
   schemas.py   请求/响应模型与不可行类别常量
   planner.py   三阶段字典序 CP-SAT 求解（平衡 → 邻接 → 确定性决胜）
   reconciler.py 扫描核对与最少步数纠位指令生成（空孔链 → 闭环暂存）
+  spatial_qc.py 空间效应质控（组内中位数中心化 → 行列中位数平滑 → 组内置换 p 值）
   metrics.py   指标独立重算与布局约束校验
   plates.py    板型预设与孔位命名解析
-tests/         pytest 测试（解析、求解、API、纠位）
+tests/         pytest 测试（解析、求解、API、纠位、空间质控）
 Dockerfile     单容器构建
-docker-compose.yml  单命令启动
+docker-compose.yml  单命令启动（映射 8000 端口）
 ```
